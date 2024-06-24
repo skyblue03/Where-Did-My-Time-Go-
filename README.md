@@ -1,4 +1,4 @@
-# TimeTrace (v0.1.0)
+# TimeTrace (v0.2.0)
 
 Local-first CLI to track command durations and generate actionable time reports.
 

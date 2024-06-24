@@ -15,3 +15,5 @@ class RunRecord:
     cwd: str
     command: str
     tag: Optional[str]
+    project: Optional[str]
+    category: Optional[str]

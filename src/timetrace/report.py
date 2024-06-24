@@ -2,23 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Optional
+from typing import Iterable
 
 from .models import RunRecord
 from .utils import format_duration, abbreviate_path
 
 
 def local_day_bounds(now_local: datetime) -> tuple[datetime, datetime]:
-    """Return [start_of_day_local, start_of_next_day_local]."""
     start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
     return start, end
-
-
-def to_local(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone()  # system local tz
 
 
 def to_utc(dt: datetime) -> datetime:
@@ -34,7 +27,19 @@ class Report:
     success_s: float
     failed_s: float
     by_project: list[tuple[str, float]]
+    by_category: list[tuple[str, float]]
     top_commands: list[tuple[str, float, int, int]]  # cmd, total_s, runs, failed_runs
+
+
+def _project_key(r: RunRecord) -> str:
+    if r.project:
+        return r.project
+    # fallback: use last directory name, but keep a hint if path is long
+    p = r.cwd.rstrip("/\\")
+    last = p.split("\\")[-1].split("/")[-1] if p else p
+    if not last:
+        last = abbreviate_path(r.cwd)
+    return last
 
 
 def build_report(runs: Iterable[RunRecord], title: str) -> Report:
@@ -43,6 +48,7 @@ def build_report(runs: Iterable[RunRecord], title: str) -> Report:
     failed_s = 0.0
 
     proj: dict[str, float] = {}
+    cat: dict[str, float] = {}
     cmd_total: dict[str, float] = {}
     cmd_runs: dict[str, int] = {}
     cmd_failed: dict[str, int] = {}
@@ -54,10 +60,11 @@ def build_report(runs: Iterable[RunRecord], title: str) -> Report:
         else:
             failed_s += r.duration_s
 
-        # project grouping: use last folder name + abbreviated full path for uniqueness
-        # keep simple for v1
-        pkey = abbreviate_path(r.cwd)
-        proj[pkey] = proj.get(pkey, 0.0) + r.duration_s
+        pk = _project_key(r)
+        proj[pk] = proj.get(pk, 0.0) + r.duration_s
+
+        ck = r.category or "other"
+        cat[ck] = cat.get(ck, 0.0) + r.duration_s
 
         cmd_total[r.command] = cmd_total.get(r.command, 0.0) + r.duration_s
         cmd_runs[r.command] = cmd_runs.get(r.command, 0) + 1
@@ -65,6 +72,8 @@ def build_report(runs: Iterable[RunRecord], title: str) -> Report:
             cmd_failed[r.command] = cmd_failed.get(r.command, 0) + 1
 
     by_project = sorted(proj.items(), key=lambda x: x[1], reverse=True)[:12]
+    by_category = sorted(cat.items(), key=lambda x: x[1], reverse=True)[:12]
+
     top_cmds_sorted = sorted(cmd_total.items(), key=lambda x: x[1], reverse=True)[:12]
     top_commands: list[tuple[str, float, int, int]] = []
     for cmd, tot in top_cmds_sorted:
@@ -76,6 +85,7 @@ def build_report(runs: Iterable[RunRecord], title: str) -> Report:
         success_s=success_s,
         failed_s=failed_s,
         by_project=by_project,
+        by_category=by_category,
         top_commands=top_commands,
     )
 
@@ -87,12 +97,24 @@ def render_report_text(rep: Report) -> str:
     lines.append(f"Total tracked: {format_duration(rep.total_s)}")
     lines.append(f"Successful:   {format_duration(rep.success_s)}")
     lines.append(f"Failed:       {format_duration(rep.failed_s)}")
+    if rep.total_s > 0 and rep.failed_s > 0:
+        ratio = rep.failed_s / rep.total_s
+        lines.append(f"Fail ratio:   {ratio:.0%}")
     lines.append("")
+
+    if rep.by_category and rep.total_s > 0:
+        lines.append("By category:")
+        for name, secs in rep.by_category:
+            lines.append(f"  {name:<14} {format_duration(secs):>10}")
+        lines.append("")
+    else:
+        lines.append("By category: (no data)")
+        lines.append("")
 
     if rep.by_project:
         lines.append("By project:")
         for name, secs in rep.by_project:
-            lines.append(f"  {name:<28} {format_duration(secs):>10}")
+            lines.append(f"  {name:<20} {format_duration(secs):>10}")
         lines.append("")
     else:
         lines.append("By project: (no data)")
@@ -109,7 +131,5 @@ def render_report_text(rep: Report) -> str:
         lines.append("")
 
     if rep.failed_s > 0:
-        ratio = (rep.failed_s / rep.total_s) if rep.total_s else 0.0
-        lines.append(f"Wasted-time signal: {format_duration(rep.failed_s)} on failing commands ({ratio:.0%} of tracked time).")
-
+        lines.append(f"Wasted-time signal: {format_duration(rep.failed_s)} on failing commands.")
     return "\n".join(lines)
