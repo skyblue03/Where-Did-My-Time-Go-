@@ -10,11 +10,7 @@ from .models import RunRecord
 from .utils import ensure_dir, default_data_dir
 
 
-SCHEMA_VERSION = 2
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+SCHEMA_VERSION = 3
 
 
 def to_iso(dt: datetime) -> str:
@@ -67,6 +63,16 @@ def init_db(conn: sqlite3.Connection) -> None:
             value TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            started_at_utc TEXT NOT NULL,
+            ended_at_utc TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at_utc);
+        CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name);
+
         CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             started_at_utc TEXT NOT NULL,
@@ -75,30 +81,35 @@ def init_db(conn: sqlite3.Connection) -> None:
             exit_code INTEGER NOT NULL,
             cwd TEXT NOT NULL,
             command TEXT NOT NULL,
-            tag TEXT
+            tag TEXT,
+            project TEXT,
+            category TEXT,
+            session_id INTEGER,
+            FOREIGN KEY(session_id) REFERENCES sessions(id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at_utc);
         CREATE INDEX IF NOT EXISTS idx_runs_cwd ON runs(cwd);
         CREATE INDEX IF NOT EXISTS idx_runs_tag ON runs(tag);
+        CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project);
+        CREATE INDEX IF NOT EXISTS idx_runs_category ON runs(category);
+        CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id);
         """
     )
 
-    # Lightweight schema migration for v2:
-    # Add columns if missing.
+    # If upgrading from older versions, columns may be missing in runs.
     if not _table_has_column(conn, "runs", "project"):
         conn.execute("ALTER TABLE runs ADD COLUMN project TEXT;")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project);")
     if not _table_has_column(conn, "runs", "category"):
         conn.execute("ALTER TABLE runs ADD COLUMN category TEXT;")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_category ON runs(category);")
+    if not _table_has_column(conn, "runs", "session_id"):
+        conn.execute("ALTER TABLE runs ADD COLUMN session_id INTEGER;")
 
     cur = conn.execute("SELECT value FROM meta WHERE key='schema_version';")
     row = cur.fetchone()
     if row is None:
         conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?);", (str(SCHEMA_VERSION),))
     else:
-        # bump stored schema version if older
         try:
             v = int(row["value"])
         except Exception:
@@ -106,6 +117,60 @@ def init_db(conn: sqlite3.Connection) -> None:
         if v < SCHEMA_VERSION:
             conn.execute("UPDATE meta SET value=? WHERE key='schema_version';", (str(SCHEMA_VERSION),))
     conn.commit()
+
+
+def get_active_session_id(conn: sqlite3.Connection) -> Optional[int]:
+    row = conn.execute("SELECT value FROM meta WHERE key='active_session_id';").fetchone()
+    if not row:
+        return None
+    try:
+        return int(row["value"])
+    except Exception:
+        return None
+
+
+def set_active_session_id(conn: sqlite3.Connection, session_id: Optional[int]) -> None:
+    if session_id is None:
+        conn.execute("DELETE FROM meta WHERE key='active_session_id';")
+    else:
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('active_session_id', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
+            (str(int(session_id)),),
+        )
+    conn.commit()
+
+
+def create_session(conn: sqlite3.Connection, *, name: str, started_at_utc: datetime) -> int:
+    cur = conn.execute(
+        "INSERT INTO sessions(name, started_at_utc) VALUES(?, ?);",
+        (name, to_iso(started_at_utc)),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def end_session(conn: sqlite3.Connection, *, session_id: int, ended_at_utc: datetime) -> None:
+    conn.execute("UPDATE sessions SET ended_at_utc=? WHERE id=?;", (to_iso(ended_at_utc), int(session_id)))
+    conn.commit()
+
+
+def fetch_sessions(conn: sqlite3.Connection, *, limit: int = 50) -> list[dict]:
+    rows = conn.execute(
+        "SELECT id, name, started_at_utc, ended_at_utc FROM sessions ORDER BY started_at_utc DESC LIMIT ?;",
+        (int(limit),),
+    ).fetchall()
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "id": int(r["id"]),
+                "name": str(r["name"]),
+                "started_at_utc": str(r["started_at_utc"]),
+                "ended_at_utc": (str(r["ended_at_utc"]) if r["ended_at_utc"] is not None else None),
+            }
+        )
+    return out
 
 
 def insert_run(
@@ -120,13 +185,14 @@ def insert_run(
     tag: Optional[str],
     project: Optional[str],
     category: Optional[str],
+    session_id: Optional[int],
 ) -> int:
     cur = conn.execute(
         """
         INSERT INTO runs(
-            started_at_utc, finished_at_utc, duration_s, exit_code, cwd, command, tag, project, category
+            started_at_utc, finished_at_utc, duration_s, exit_code, cwd, command, tag, project, category, session_id
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             to_iso(started_at_utc),
@@ -138,6 +204,7 @@ def insert_run(
             tag,
             project,
             category,
+            (int(session_id) if session_id is not None else None),
         ),
     )
     conn.commit()
@@ -150,32 +217,35 @@ def fetch_runs_between(
     start_utc: datetime,
     end_utc: datetime,
     limit: int = 10000,
-    cwd_prefix: Optional[str] = None,
     tag: Optional[str] = None,
     project: Optional[str] = None,
     category: Optional[str] = None,
+    session_id: Optional[int] = None,
 ) -> list[RunRecord]:
     q = """
-        SELECT id, started_at_utc, finished_at_utc, duration_s, exit_code, cwd, command, tag, project, category
-        FROM runs
-        WHERE started_at_utc >= ? AND started_at_utc < ?
+        SELECT
+            r.id, r.started_at_utc, r.finished_at_utc, r.duration_s, r.exit_code, r.cwd, r.command,
+            r.tag, r.project, r.category, r.session_id, s.name AS session_name
+        FROM runs r
+        LEFT JOIN sessions s ON s.id = r.session_id
+        WHERE r.started_at_utc >= ? AND r.started_at_utc < ?
     """
     params: list[object] = [to_iso(start_utc), to_iso(end_utc)]
 
-    if cwd_prefix:
-        q += " AND cwd LIKE ?"
-        params.append(str(cwd_prefix) + "%")
     if tag:
-        q += " AND tag = ?"
+        q += " AND r.tag = ?"
         params.append(tag)
     if project:
-        q += " AND project = ?"
+        q += " AND r.project = ?"
         params.append(project)
     if category:
-        q += " AND category = ?"
+        q += " AND r.category = ?"
         params.append(category)
+    if session_id is not None:
+        q += " AND r.session_id = ?"
+        params.append(int(session_id))
 
-    q += " ORDER BY started_at_utc ASC LIMIT ?"
+    q += " ORDER BY r.started_at_utc ASC LIMIT ?"
     params.append(int(limit))
 
     rows = conn.execute(q, params).fetchall()
@@ -193,6 +263,8 @@ def fetch_runs_between(
                 tag=(str(r["tag"]) if r["tag"] is not None else None),
                 project=(str(r["project"]) if r["project"] is not None else None),
                 category=(str(r["category"]) if r["category"] is not None else None),
+                session_id=(int(r["session_id"]) if r["session_id"] is not None else None),
+                session_name=(str(r["session_name"]) if r["session_name"] is not None else None),
             )
         )
     return out
@@ -201,9 +273,12 @@ def fetch_runs_between(
 def fetch_recent_runs(conn: sqlite3.Connection, *, limit: int = 20) -> list[RunRecord]:
     rows = conn.execute(
         """
-        SELECT id, started_at_utc, finished_at_utc, duration_s, exit_code, cwd, command, tag, project, category
-        FROM runs
-        ORDER BY started_at_utc DESC
+        SELECT
+            r.id, r.started_at_utc, r.finished_at_utc, r.duration_s, r.exit_code, r.cwd, r.command,
+            r.tag, r.project, r.category, r.session_id, s.name AS session_name
+        FROM runs r
+        LEFT JOIN sessions s ON s.id = r.session_id
+        ORDER BY r.started_at_utc DESC
         LIMIT ?;
         """,
         (int(limit),),
@@ -223,6 +298,8 @@ def fetch_recent_runs(conn: sqlite3.Connection, *, limit: int = 20) -> list[RunR
                 tag=(str(r["tag"]) if r["tag"] is not None else None),
                 project=(str(r["project"]) if r["project"] is not None else None),
                 category=(str(r["category"]) if r["category"] is not None else None),
+                session_id=(int(r["session_id"]) if r["session_id"] is not None else None),
+                session_name=(str(r["session_name"]) if r["session_name"] is not None else None),
             )
         )
     return out

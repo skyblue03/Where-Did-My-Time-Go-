@@ -17,3 +17,5 @@ class RunRecord:
     tag: Optional[str]
     project: Optional[str]
     category: Optional[str]
+    session_id: Optional[int]
+    session_name: Optional[str]
