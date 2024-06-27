@@ -14,7 +14,7 @@ Optional:
 - `export TIMETRACE_TAG="course"`
 
 ## PowerShell
-Add this to your PowerShell profile:
+Add this to your PowerShell profile (preserves your existing prompt):
 
 ```powershell
 Invoke-Expression (& timetrace init powershell)
